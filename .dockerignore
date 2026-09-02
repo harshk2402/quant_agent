@@ -1,0 +1,25 @@
+# NEVER vendor the competition kit or its task data into the image.
+# The task data is QF-Bench v1 material redistributed for non-commercial academic use --
+# copying it in would redistribute it under OUR licence, which is not ours to grant
+# (starter-packs/track1/AGENTS.md, "Never vendor the task data into your image").
+# The kit lives OUTSIDE this repo (a sibling dir), so it cannot enter the build context --
+# these entries are belt-and-braces in case that ever changes.
+track1-coding-public/
+Agenthon2026-public/
+units/
+
+# Secrets: the image needs no key at scoring time and must never contain one.
+.env
+
+# Dev-only -- not shipped.
+tools/
+tests/
+.venv/
+.git/
+.gitignore
+PLAN.md
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
