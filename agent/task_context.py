@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Task-context parser for QFBench 2.0 Track 1 units.  (Phase 0, Step 0.1)
 
 Why this module exists

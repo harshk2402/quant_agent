@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Smoke-test the LLM client: which backend am I on, what can it reach, does a call work?
 
     python3 tools/check_llm.py            # show config + make one tiny call

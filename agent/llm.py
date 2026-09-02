@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """OpenAI-compatible LLM client for the QFBench T1 agent.  (Phase 0, Step 0.2)
 
 One code path, two deployments

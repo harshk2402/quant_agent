@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Score the task-context parser against ground truth, across every public unit.
 
 Ground truth = the filenames each unit's own `checks/test_outputs.py` actually opens

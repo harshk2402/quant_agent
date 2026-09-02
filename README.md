@@ -27,25 +27,44 @@ a mess. `$QFBENCH_KIT` overrides the kit location if you keep it elsewhere.
 
 | | |
 |---|---|
-| `agent/` | **shipped code.** `task_context.py` (parses each unit's I/O contract), `llm.py` (OpenAI-compatible client) |
+| `agent/` | **shipped code.** `solve.py` (the CLI contract), `task_context.py` (parses each unit's I/O contract), `llm.py` (OpenAI-compatible client) |
 | `tools/` | **dev only, never shipped.** Validators and harnesses |
+| `tests/` | **dev only.** Contract tests — the failures that zero a unit without touching finance |
+| `scripts/` | **dev only.** Thin wrappers over the build/run/grade commands |
+| `docker/` | the submission image |
 
 ## Setup
 
+The virtualenv lives one level up at `Agenthon/.venv`, shared with the two competition kits, and
+already has both required packages:
+
 ```bash
-python3 -m venv .venv && ./.venv/bin/pip install -e ../track1-coding-public \
-  && ./.venv/bin/pip install "qfbench2-common @ git+https://github.com/Agenthon-2026/Agenthon2026-public.git@v2.3.1#subdirectory=common"
+../.venv/bin/pip install -e ../track1-coding-public
+../.venv/bin/pip install "qfbench2-common @ git+https://github.com/Agenthon-2026/Agenthon2026-public.git@v2.3.1#subdirectory=common"
 cp .env.example .env      # then add your dev API key
 ```
 
-Both packages are required together: `qfbench2-smoke` ships in `qfbench2-common` but imports
+Both packages are required **together**: `qfbench2-smoke` ships in `qfbench2-common` but imports
 `qfbench2_track_coding` from the kit, and neither works alone.
+
+## Everyday commands
+
+```bash
+scripts/build.sh                              # build linux/amd64 + verify arch and label
+scripts/run-unit.sh t1-zero-coupon-bootstrapping   # one unit, exactly as the harness runs it
+scripts/selfgrade.sh t1-zero-coupon-bootstrapping  # that unit's REAL checker -> reward.json
+scripts/conformance.sh                        # the organizers' sweep over all 87 units
+```
+
+`build.sh` always passes `--platform linux/amd64`. The fleet is x86-64; an arm64 image does not
+run, and on Apple silicon a plain `docker build` produces one silently.
 
 ## Checks
 
 ```bash
-python3 tools/check_llm.py                  # dev model reachable?
-python3 tools/validate_task_context.py      # parser vs all 87 units' real graders
+../.venv/bin/python -m pytest tests/ -q      # contract tests (93)
+python3 tools/check_llm.py                   # dev model reachable?
+python3 tools/validate_task_context.py       # parser vs all 87 units' real graders
 ```
 
 ## License

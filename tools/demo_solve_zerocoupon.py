@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """End-to-end proof that the parsed contract is actionable.
 
 The numerics are hand-written (no LLM yet -- that's Step 0.2), but EVERY path and
