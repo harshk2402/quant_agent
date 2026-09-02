@@ -468,6 +468,30 @@ Traps, in order of how likely they are to bite:
    on the suffix and enforces neither — use the suffixed form).
 7. `license` is **our own code's** licence, not the task data's. Do not vendor task data.
 
+#### 4.8 `t1-polars-api-migration` — the one unit a placeholder can never pass
+
+First conformance sweep with the placeholder agent: **86/87 ok, 0 crashed, 0 unchecked**. The single
+miss is `t1-polars-api-migration`, and it is not a parser bug.
+
+- `instruction.md` declares exactly one deliverable, `/app/output/function-under-new-api.py` — a
+  migrated Polars pipeline function. Our parser reports that correctly.
+- Its `checks/test_outputs.py` never imports or calls `pipeline_new`. It asserts that
+  `polars_version.csv` and `step_1.csv … step_11.csv` **already exist in `/app/output`** and match
+  `/tests/reference_data`.
+
+So the deliverable is *code that must also be executed*: we have to write the script **and run it**
+so its CSV side-effects land in the output directory. A placeholder that writes an empty `.py`
+produces no CSVs and cannot pass, by construction — **86/87 is the correct ceiling for a no-op
+agent**, not a defect to fix in the skeleton.
+
+Two consequences:
+
+1. **0.3 handles this naturally** — the loop generates code, executes it, and deliverables appear as
+   side-effects. This unit just also needs the script itself preserved as a deliverable.
+2. **It is the strongest argument yet for reading `checks/*.py` at run time** (§3.5 correction).
+   Prose gives one filename here; the checker gives thirteen. AGENTS.md calls the checker "the only
+   machine-readable statement of the output contract" — this unit shows exactly why.
+
 ### Phase 1 — Derivatives pricing (~25 units, highest leverage)
 
 Port to `pricing/`: `models/black_scholes.py`, `models/binomial.py` (CRR American + European),
