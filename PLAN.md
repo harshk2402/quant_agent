@@ -34,8 +34,50 @@ Registration closes **Sep 28** and is required to submit or appear on the leader
 |---|---|
 | Environment | ✅ validated end-to-end |
 | Architecture decisions | ✅ made (see §3) |
-| Agent code | 🟡 Phase 0 Step 0.1 complete (`agent/task_context.py`) |
-| Next action | **Phase 0, Step 0.2 — solve-loop skeleton** |
+| Agent code | ✅ **Phase 0 complete** — the agent generates, executes, validates and repairs |
+| Measured | **pass@1 0.299** (26/87 public tasks, graded by the organizers' own checkers) — **measured in the local venv, not in the submission image; see §4.9** |
+| Next action | **Step 0.8** (image parity, §4.9), then Phase 1 or the diagnostics in §1.1 |
+
+### 1.1 Where the 61 losses are (full sweep, 2026-09-09)
+
+```
+produced_output   62   (23 passed)   ran clean, wrote the right files, numbers often wrong
+exec_failed       17   (0 passed)    the generated script still crashes after 3 attempts
+contract_error     8   (3 passed)    ran, but the output does not satisfy the contract
+```
+
+Structural failure is no longer the main story — **62 of 87 tasks now produce clean, correctly
+named output**, and the remaining question for most of them is whether the finance is right. That
+is the transition the repair loop was built to cause, and it is what makes section-wise domain work
+(Phases 1–7) the productive next move.
+
+Three things are worth attacking before, or alongside, the domain work:
+
+1. **8 tasks account for 118 `missing_file` errors.** All are multi-deliverable tasks wanting 8–15
+   files. That concentration suggests one fixable cause — prompt or repair-message shape — rather
+   than eight separate domain problems.
+2. **17 tasks still crash.** Worth checking whether they exhaust the attempt limit or fail the same
+   way every time; the second is cheap to fix, the first argues for a higher bound.
+3. **Run-to-run variance is large.** Two consecutive runs of the same 16-task set, with no code
+   change, gave 6 and then 8 passes — at `temperature=0`. Any improvement smaller than about three
+   tasks is indistinguishable from noise on a set that size.
+
+### 1.2 Measurement budget (this matters more than it sounds)
+
+Measured from the dashboard: the dev key allows **500 requests/day**, 15 RPM, 250K TPM. Observed
+usage puts RPM at 13/15 *sequentially*, so **parallelising the sweep is not available** — it would
+breach the request rate immediately.
+
+| Run | Requests | Wall time |
+|---|---|---|
+| Full sweep (87 tasks) | ~176 | ~44 min |
+| Representative set (16) | ~33 | ~6 min |
+| Smoke set (5) | ~10 | ~2 min |
+
+So a full sweep costs a third of the daily allowance. **Iterate on the representative set; reserve
+full sweeps for milestones.** Repeating a full sweep three times to average out variance would need
+~530 requests and is therefore impossible in a day — widening the representative set is the cheaper
+route to a stabler number.
 
 ### Environment facts already established
 
@@ -270,17 +312,29 @@ Work is **stepwise**: one step assigned at a time, verified concretely in Docker
 
 | Step | Deliverable |
 |---|---|
-| **0.1** | ✅ **Task-context parser** — `agent/task_context.py`. **100% recall (0 missed deliverables)** across the 68 units with ground truth. Parser-driven solve of `t1-zero-coupon-bootstrapping` → **reward 1.0**. |
+| **0.1** | ✅ **Task-context parser** — `agent/task_context.py`. **0.992 recall across all 87 tasks**; every miss is in `t1-polars-api-migration`, whose deliverable is code that must also be run (§4.8). It also reads the unit's own checker when that is mounted, which is exact where prose is inferred. *(An earlier "100% recall" figure was measured over only 68 tasks — the ground-truth reader was silently skipping 19 whose checkers name files as paths rather than bare strings.)* |
 | **0.2** | ✅ **LLM client** — `agent/llm.py` (stdlib-only, OpenAI-compatible). Scoring/dev/offline backends resolve; verified inside the sandbox image; `.env` proven unable to shadow `MODEL_ENDPOINT`. Dev path **verified live** against Gemini. See §4.1. |
-| **0.3** | **Solve-loop skeleton ← next action** — prompt (incl. `render_output_contract`, **canary-stripped §2.5**) → LLM call → extract code → **stage inputs (§4.5)** → execute in a scratch dir (**never the output dir, §2.5**) → capture stdout/traceback |
-| **0.4** | **Output-contract validator** (ships in the image). Deterministic checks from `TaskContext`: every declared file exists, parses in its declared format, is non-empty, `reward.json` not written, **and no canary GUID appears in any output text file (§2.5)**. Column check is a **soft signal only** — §4.3. |
-| **0.5** | **Submission image + CLI contract** — §4.6. Must come before 0.6, which runs the agent as an image. Slow build (TA-Lib from source), so start it early. |
-| **0.6** | **Offline eval harness** (dev-only, never shipped) — runs the agent over the 87 public units, scored by each unit's *real* `checks/test.sh` in Docker. Produces the **baseline number** every later phase is judged against. |
-| **0.7** | **Repair loop** — feed 0.4 failures and tracebacks back to the LLM, retry, bounded by attempts/timeout/token budget. Measured as a *delta against the 0.6 baseline*, not in isolation. |
+| **0.3** | ✅ **Solve loop** — `agent/prompt.py` + `agent/execute.py`. Prompt (canary-stripped, resolved input paths) → generate → stage inputs → execute in a scratch dir, never the output dir. First live solve scored **reward 1.0** on `t1-zero-coupon-bootstrapping`. |
+| **0.4** | ✅ **Output-contract validator** — `agent/validate.py`. Missing, empty and unparseable files; the grader's own `reward.json`; NaN and infinity; a header with no rows; and values that cannot be right whatever the finance says (negative price, probability above one). Canary removal is the one check that **repairs rather than reports**, since detecting a leak and doing nothing still scores zero. Rules are conservative — a false alarm sends repair chasing a problem that never existed. Column check stays a **warning** (§4.3). |
+| **0.5** | ✅ **Submission image + CLI contract** — `docker/Dockerfile`, built `linux/amd64`. Verb resolves, label present, exits 0. Conformance sweep **87/87, zero crashes**. Stage 2 of the image is still outstanding (see the exit criterion below). |
+| **0.6** | ✅ **Offline eval harness** — `tools/baseline_sweep.py` + `tools/testsets.py`. Runs the agent over the public tasks, grades with their real checkers, and labels every task by outcome, because a single pass rate cannot separate a crashed script from one that ran and got the numbers wrong. A quota guard stops a sweep after three consecutive rate-limit refusals rather than recording them as agent failures. |
+| **0.7** | ✅ **Repair loop** — bounded by attempts, wall clock and token budget. Feeds back both the traceback and the contract findings; the second matters because a script that runs cleanly gives the model no reason to suspect anything is wrong. **Crashes fell from 55% of tasks to 20%, and 12 tasks passed only because a retry fixed them.** |
+| **0.8** | ⬜ **Run the real agent inside the image, and check it matches** — see §4.9. Everything measured so far ran in the local venv, not in the artifact we would submit. |
 
-**Exit criterion:** a skeleton agent (no pricing library, no category logic) solves the exemplar
-end-to-end through the full loop — not a manually-run script — and 0.3b reports a baseline pass rate
-across the public units.
+**Exit criterion — met.** The agent is packaged as a real `linux/amd64` submission image, runs the
+full loop across all 87 public tasks, and 0.6 reports a baseline of **pass@1 0.299**. 0.7 improved
+on it measurably: the share of tasks whose script crashed fell from 55% to 20%.
+
+Two items are deferred out of Phase 0, neither blocking:
+
+- **Stage 2 of the image.** It currently carries only numpy, pandas, scipy and pyarrow. The sweep
+  proved the rest of the sandbox stack is needed — a generated script reached for `statsmodels` and
+  died — so statsmodels, scikit-learn, arch, polars, matplotlib, seaborn, plotly, openpyxl, numba
+  and a TA-Lib source build must go in before any submission. Slow under emulation; do it once,
+  early, rather than discovering it near a deadline.
+- **Reading column names from the unit's checker.** Filenames already come from it; columns are
+  still inferred from prose, which is precisely why a column mismatch can only warn. Reading them
+  from the checker is what would justify making it an error.
 
 #### 4.1 The LLM client must come first (Step 0.2)
 
@@ -467,6 +521,36 @@ Traps, in order of how likely they are to bite:
 6. `competition_id` = **`agenthon2026-coding-dev`** for Development (the toolkit contradicts itself
    on the suffix and enforces neither — use the suffixed form).
 7. `license` is **our own code's** licence, not the task data's. Do not vendor task data.
+
+#### 4.9 Step 0.8 — the image has never run the real agent
+
+**Every number in §1 was produced by the local venv, not by the image we would submit.** That is a
+gap in what has actually been verified, and it has three parts:
+
+1. **The built image predates the agent.** It was last built at Step 0.5, before `prompt.py`,
+   `execute.py`, `validate.py` and the repair loop existed. It contains a placeholder.
+2. **The image has never made a model call.** `conformance.sh` runs `--network=none` and passes no
+   key, so generation always fails there and the placeholder floor takes over — which is why
+   87/87 was achieved with zero model calls. That result says the packaging is sound; it says
+   nothing about the agent.
+3. **The environments differ.** The venv now carries the full sandbox stack (statsmodels,
+   scikit-learn, arch, polars, numba and the rest); the image carries four packages. A generated
+   script that imports `statsmodels` succeeds locally and fails in the image. **So the sweep is
+   currently measuring something we do not ship.**
+
+What 0.8 requires:
+
+- Stage 2 of the image (the deferred item above): the full sandbox stack plus a TA-Lib source
+  build, under `linux/amd64` emulation.
+- Rebuild with the current agent code.
+- A dev-mode run of the image *with* model access — normal Docker networking and the key passed
+  via `docker run -e`, never baked in.
+- **A parity check**: run the representative set through the image and compare against the same
+  set run locally. Any divergence means the local number is not a measurement of the submission,
+  and the image is what counts.
+
+Cheap to state, and easy to leave until it is expensive. Until it passes, treat pass@1 0.299 as a
+measurement of the code rather than of the artifact.
 
 #### 4.8 `t1-polars-api-migration` — the one unit a placeholder can never pass
 
