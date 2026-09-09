@@ -35,6 +35,7 @@ import dataclasses
 import json
 import os
 import pathlib
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -170,11 +171,28 @@ class LLMResponse:
 # the call
 # ---------------------------------------------------------------------------
 
+def _ssl_context():
+    """TLS context for dev calls.
+
+    A python.org macOS build ships no CA bundle, so HTTPS to a vendor endpoint fails with
+    CERTIFICATE_VERIFY_FAILED even though the same call works under a system Python. Prefer
+    `certifi` when it is installed and fall back to the system store otherwise.
+
+    Not required at scoring time, where the house endpoint is reached over plain HTTP through the
+    audited proxy; it exists so local development works under any interpreter.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return None          # urllib then uses the interpreter's default verification
+
+
 def _post(url: str, payload: dict, headers: dict, timeout: float) -> dict:
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(), headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:   # honours *_PROXY env
-        return json.loads(resp.read().decode())
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+        return json.loads(resp.read().decode())                  # urlopen honours *_PROXY env
 
 
 def chat(

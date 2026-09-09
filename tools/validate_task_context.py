@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
 """Score the task-context parser against ground truth, across every public unit.
 
-Ground truth = the filenames each unit's own `checks/test_outputs.py` actually opens
-under OUTPUT_DIR.  That file is stripped from the submission mount, so the agent can
-never see it -- which is exactly why it makes an honest held-out test set here.
+Ground truth = the filenames each unit's own `checks/*.py` actually opens under OUTPUT_DIR.
+
+This grades the PROSE parse specifically (`use_checks=False`). The agent may also read the
+checker at run time when it is mounted, but that path cannot be graded here -- it IS the ground
+truth, so it would agree with itself. What needs measuring is the fallback: how well prose alone
+recovers the contract when the checker is absent.
 
 The practice kit is a SIBLING of this repo, not part of it -- their task data must never
 be vendored into our image (licence: it is QF-Bench v1 material, not ours to relicense).
@@ -21,32 +24,55 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from agent.task_context import (  # noqa: E402
-    DATA_EXTS, NEVER_OUTPUT, _dockerfile_dests, _manifest_inputs, parse_task,
-)
+from agent.task_context import DATA_EXTS, NEVER_OUTPUT, parse_task  # noqa: E402
 
 _EXT_ALT = "|".join(DATA_EXTS)
-_LIT = re.compile(rf"""['"]([A-Za-z0-9_][A-Za-z0-9_.\-]*\.(?:{_EXT_ALT}))['"]""")
+
+# A quoted filename OR a quoted path ending in one. The path form is the one the previous
+# extractor missed entirely: checkers overwhelmingly write f"{OUTPUT_DIR}/results.csv" or
+# Path("/app/output/x.json"), not a bare "results.csv" -- so 19 of 87 units yielded no ground
+# truth at all and were silently skipped rather than graded.
+_QUOTED = re.compile(rf"""['"]([A-Za-z0-9_./{{}}-]+\.(?:{_EXT_ALT}))['"]""")
+
+# Position, not spelling, separates a deliverable from an input (the organizers' own wording in
+# conformance.sh). A checker reaches an INPUT through a data/reference root and a LOG artefact
+# through a log root; those files already exist, so crediting them would pass an agent that wrote
+# nothing of its own. Veto the whole line when it reaches into one of those roots.
+_ROOT_VETO = re.compile(
+    r"(data|input|ref|reference|log)_(dir|path)"
+    r"|input_(json|csv|parquet|text)"
+    r"|/app/data|/input|/tests/reference|/logs"
+    r"|[^a-z0-9_](data|ref) */",
+    re.I,
+)
+# What survives must be either a bare name (a helper joins it to the output dir) or explicitly
+# output-rooted.
+_OUTPUT_ROOTED = re.compile(r"^(/app)?/output/|^\{OUTPUT_DIR\}/")
 
 
 def ground_truth(unit: pathlib.Path) -> set[str]:
-    """Filenames the checks read from the OUTPUT dir."""
-    f = unit / "checks" / "test_outputs.py"
-    if not f.is_file():
-        return set()
-    text = f.read_text(encoding="utf-8", errors="replace")
+    """Filenames the unit's checker resolves against the OUTPUT dir.
 
-    # Names the checks join to the INPUT dir, or to the organizer's reference-data dir
-    # (REF_DIR -> checks/reference_data), are not deliverables.
-    input_side = set()
-    for line in text.splitlines():
-        if re.search(r"INPUT_DIR|/input|REF_DIR|reference_data", line):
-            input_side.update(_LIT.findall(line))
-
-    names = set(_LIT.findall(text)) - input_side - NEVER_OUTPUT
-    names -= {pathlib.PurePosixPath(p).name for p in _manifest_inputs(unit)}
-    names -= set(_dockerfile_dests(unit))
-    return {n for n in names if not n.endswith(".py")}
+    Reads every `checks/*.py`, not just test_outputs.py: on some units test_outputs.py is a thin
+    shim that delegates to checks/verifier.py and names no file itself.
+    """
+    names: set[str] = set()
+    for f in sorted((unit / "checks").glob("*.py")):
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if _ROOT_VETO.search(line):
+                continue
+            for tok in _QUOTED.findall(line):
+                if "/" in tok and not _OUTPUT_ROOTED.match(tok):
+                    continue
+                base = tok.rsplit("/", 1)[-1]
+                if "{" in base or "}" in base:      # an f-string hole, not a name
+                    continue
+                names.add(base)
+    return names - NEVER_OUTPUT
 
 
 def main() -> int:
@@ -68,7 +94,10 @@ def main() -> int:
     problems = []
 
     for u in units:
-        ctx = parse_task(u, probe_filesystem=False)
+        # use_checks=False is essential: this script grades the PROSE parse against the
+        # checker. If the parser were also allowed to read the checker, it would be scored
+        # against its own input and would agree by construction.
+        ctx = parse_task(u, probe_filesystem=False, use_checks=False)
         pred = set(ctx.output_filenames)
         if not pred:
             zero_out.append(u.name)

@@ -8,8 +8,10 @@ solve --task-dir /input --out /app/output
 ```
 
 Category `api` — the contribution is the harness and prompts; the model is the
-organizer-hosted house endpoint. See [PLAN.md](PLAN.md) for the full plan, the traps found so
-far, and current status.
+organizer-hosted house endpoint.
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — how the agent works, function by function
+- [PLAN.md](PLAN.md) — the competition plan, the traps found so far, and current status
 
 ## Repository layout — this repo is a sibling of the competition repos
 

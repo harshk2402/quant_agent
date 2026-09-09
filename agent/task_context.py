@@ -61,6 +61,22 @@ FORMAT_BY_EXT = {
     "zip": "zip", "py": "python",
 }
 
+# --- reading the unit's own checker (see _outputs_from_checks) -------------------------------
+# A quoted filename, or a quoted PATH ending in one. The path form dominates in practice:
+# checkers write f"{OUTPUT_DIR}/results.csv" far more often than a bare "results.csv".
+_CHECK_QUOTED = re.compile(rf"""['"]([A-Za-z0-9_./{{}}-]+\.(?:{_EXT_ALT}))['"]""")
+# Position, not spelling, separates a deliverable from an input. A checker reaches an INPUT
+# through a data/reference root and a LOG artefact through a log root; both already exist before
+# the agent runs, so crediting them would "find" deliverables we never wrote.
+_CHECK_ROOT_VETO = re.compile(
+    r"(data|input|ref|reference|log)_(dir|path)"
+    r"|input_(json|csv|parquet|text)"
+    r"|/app/data|/input|/tests/reference|/logs"
+    r"|[^a-z0-9_](data|ref) */",
+    re.I,
+)
+_CHECK_OUTPUT_ROOTED = re.compile(r"^(/app)?/output/|^\{OUTPUT_DIR\}/")
+
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 # A filename, optionally prefixed by an explicit output directory.
 _FILE_RE = re.compile(
@@ -94,6 +110,7 @@ class OutputSpec:
     declared_path: str | None = None  # exact path as written, e.g. "/app/output/results.json"
     schema_text: str = ""             # the markdown describing this file, verbatim, for the LLM
     columns: list[str] = dataclasses.field(default_factory=list)
+    source: str = "instruction"       # "instruction" | "checks" | "both" -- provenance, for debugging
 
     def path_in(self, output_dir: str | os.PathLike[str]) -> pathlib.Path:
         return pathlib.Path(output_dir) / self.filename
@@ -296,6 +313,45 @@ def _manifest_inputs(task_dir: pathlib.Path) -> list[str]:
 # card.toml
 # ---------------------------------------------------------------------------
 
+def _outputs_from_checks(task_dir: pathlib.Path) -> list[str]:
+    """Deliverable filenames taken from the unit's own `checks/*.py`, in file order.
+
+    This is the exact statement of the output contract -- the code that decides the score --
+    where instruction.md is prose written for a human and can be incomplete. On
+    `t1-polars-api-migration` the prose names one deliverable and the checker names three more.
+
+    It is not always available: the participant pack says the whole unit directory is mounted at
+    /input "including checks/test_outputs.py ... read it at run time when it is present and fall
+    back when it is not", while the organizers' own dataset builder strips `checks/` as answer
+    material. So this is strictly an ENRICHMENT -- never a requirement. Empty list means fall back
+    to prose, which is what parse_task does.
+
+    Every `checks/*.py` is read, not just test_outputs.py: on some units that file is a thin shim
+    that delegates to checks/verifier.py and names no deliverable itself.
+    """
+    checks = task_dir / "checks"
+    if not checks.is_dir():
+        return []
+    names: list[str] = []
+    for f in sorted(checks.glob("*.py")):
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if _CHECK_ROOT_VETO.search(line):
+                continue
+            for tok in _CHECK_QUOTED.findall(line):
+                if "/" in tok and not _CHECK_OUTPUT_ROOTED.match(tok):
+                    continue
+                base = tok.rsplit("/", 1)[-1]
+                if "{" in base or "}" in base:      # an f-string hole, not a name
+                    continue
+                if base not in names and base not in NEVER_OUTPUT:
+                    names.append(base)
+    return names
+
+
 def _read_card(task_dir: pathlib.Path) -> dict:
     card = task_dir / "card.toml"
     if not card.is_file() or tomllib is None:
@@ -393,11 +449,14 @@ def parse_task(
     task_dir: str | os.PathLike[str] = "/input",
     *,
     probe_filesystem: bool = True,
+    use_checks: bool = True,
 ) -> TaskContext:
     """Parse one unit directory into a TaskContext.
 
-    `probe_filesystem=False` keeps it pure (no disk probing for input resolution),
-    which is what the offline validator uses.
+    `probe_filesystem=False` keeps it pure (no disk probing for input resolution).
+    `use_checks=False` disables reading the unit's checker, leaving ONLY the prose parse --
+    which is what the offline validator must use, since it grades the prose parse against the
+    checker. Sharing that source both sides would make the comparison circular.
     """
     task_dir = pathlib.Path(task_dir)
     ctx = TaskContext(task_dir=task_dir)
@@ -459,9 +518,12 @@ def parse_task(
             candidates=cands,
         )
         if probe_filesystem:
+            # Always store an ABSOLUTE path. Generated code is executed from a scratch directory,
+            # so a relative path resolved here (e.g. "../track1-coding-public/units/<id>/...")
+            # raises FileNotFoundError there. Observed during Step 0.3 integration testing.
             for c in cands:
                 if pathlib.Path(c).is_file():
-                    spec.resolved = c
+                    spec.resolved = str(pathlib.Path(c).resolve())
                     break
             if spec.resolved is None:
                 for root in ("/app", "/input", str(task_dir)):
@@ -470,7 +532,7 @@ def parse_task(
                         continue
                     hit = next((p for p in rp.rglob(name) if p.is_file()), None)
                     if hit:
-                        spec.resolved = str(hit)
+                        spec.resolved = str(hit.resolve())
                         break
             if spec.resolved is None:
                 ctx.warnings.append(f"input {name!r} not found on disk; tried {cands}")
@@ -488,6 +550,23 @@ def parse_task(
                 columns=_columns_from(schema) if fmt_is_tabular(name) else [],
             )
         )
+    # Enrich with the checker when it is mounted. Union rather than replace: the prose can name a
+    # real deliverable the checker never asserts on (t1-sec-8k-event-alpha), and the checker can
+    # name deliverables the prose omits (t1-polars-api-migration). Both must be written.
+    if use_checks:
+        declared = {o.filename for o in ctx.outputs}
+        for name in _outputs_from_checks(task_dir):
+            if name in input_basenames:
+                continue
+            if name in declared:
+                next(o for o in ctx.outputs if o.filename == name).source = "both"
+            else:
+                ctx.outputs.append(OutputSpec(
+                    filename=name,
+                    fmt=FORMAT_BY_EXT.get(name.rsplit(".", 1)[-1].lower(), "unknown"),
+                    source="checks",
+                ))
+
     if not ctx.outputs:
         ctx.warnings.append(
             "NO deliverable filename found in instruction.md -- do NOT guess "
