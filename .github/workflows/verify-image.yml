@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: MIT
+#
+# Build the submission image and verify it on native x86-64 hardware.
+#
+# Why this exists: the competition fleet is x86-64, and the image has to be verified on that
+# architecture. Doing it on an Apple-silicon Mac means emulating amd64, and under emulation several
+# libraries never finish importing — arch (via numba's JIT) ran for over 52 minutes, polars for
+# another 52. That is a limit of binary translation, not a defect in the image, but it means the
+# import check cannot be run locally at all. GitHub's ubuntu-latest runner is native x86-64, so here
+# every import is checked for real, in seconds.
+#
+# What it checks is scripts/verify-image.sh: architecture, the interface label, that the `solve`
+# verb resolves and exits 0 against a real task, and that all sixteen sandbox libraries import.
+#
+# It makes NO model calls and needs NO secrets. The verb check runs offline, so generation fails
+# and the placeholder path is exercised — this verifies the artifact, not the agent's answers.
+#
+# To run it by hand: the repository's Actions tab -> verify-image -> Run workflow.
+
+name: verify-image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "docker/**"
+      - "agent/**"
+      - "scripts/build.sh"
+      - "scripts/verify-image.sh"
+      - ".github/workflows/verify-image.yml"
+  pull_request:
+    paths:
+      - "docker/**"
+      - "agent/**"
+      - "scripts/build.sh"
+      - "scripts/verify-image.sh"
+      - ".github/workflows/verify-image.yml"
+
+# Read-only: this workflow builds and inspects locally and publishes nothing.
+permissions:
+  contents: read
+
+# A newer push to the same branch makes an in-progress verification of older code pointless.
+concurrency:
+  group: verify-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # The scripts locate the practice kit as a SIBLING directory of this repo, so both are checked
+      # out side by side under the workspace, mirroring the local layout.
+      - name: Check out quant_agent
+        uses: actions/checkout@v4
+        with:
+          path: quant_agent
+
+      # Only the one task the verb check runs against is fetched. The kit is licensed CC BY-NC 4.0
+      # and is used here purely as test input inside an ephemeral runner; nothing from it is built
+      # into the image or published.
+      - name: Check out the practice task used by the verb check
+        uses: actions/checkout@v4
+        with:
+          repository: Agenthon-2026/track1-coding-public
+          path: track1-coding-public
+          sparse-checkout: units/t1-zero-coupon-bootstrapping
+
+      # If this ever lands on a non-x86 runner, the whole run proves nothing about the fleet. Fail
+      # immediately rather than produce a misleading green tick.
+      - name: Confirm the runner is native x86-64
+        run: |
+          arch="$(uname -m)"
+          echo "runner architecture: $arch"
+          if [ "$arch" != "x86_64" ]; then
+            echo "::error::expected a native x86_64 runner, got $arch — this run would not verify the submission architecture"
+            exit 1
+          fi
+
+      - name: Build the submission image (linux/amd64, native)
+        working-directory: quant_agent
+        run: scripts/build.sh
+
+      - name: Verify the image
+        working-directory: quant_agent
+        run: |
+          set -o pipefail
+          scripts/verify-image.sh quant-agent:dev | tee verify.log
+          # verify-image.sh prints PARTIAL, not PASS, if it believes it is running under emulation.
+          # That must never happen on this runner; if it does, treat it as a failure rather than a pass.
+          # Matched without the em dash, so the check does not depend on the runner's locale.
+          if ! grep -qE '^PASS .* image is submittable' verify.log; then
+            echo "::error::verification did not report a full pass"
+            exit 1
+          fi
+
+      - name: Record image size
+        if: always()
+        run: docker images quant-agent:dev --format 'quant-agent:dev  {{.Size}}' || true
