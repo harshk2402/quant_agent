@@ -1,0 +1,114 @@
+# SPDX-License-Identifier: MIT
+#
+# Run the agent INSIDE the submission image, with model access, on native x86-64.  (Step 0.8b)
+#
+# Why this exists: every pass rate recorded so far came from the local virtualenv, not from the
+# image we would submit. The image has been verified as an artifact (verify-image.yml), but it has
+# never made a model call. This workflow is where it does.
+#
+# Why CI rather than locally: the representative task set includes GARCH tasks that import `arch`,
+# and under amd64 emulation on Apple silicon that import does not finish (it ran 52+ minutes). Each
+# such hang would read as an agent failure. The ubuntu-latest runner is native x86-64, so it doesn't.
+#
+# ---------------------------------------------------------------------------------------------
+# CURRENT SCOPE: a single model call.
+#
+# The first run proves the plumbing before spending budget: that the secret exists, reaches the
+# container, and authenticates, and that the container can reach the model. A misnamed secret or a
+# network problem is then discovered for one request instead of ~33. The representative-set sweep
+# is added in the next step, once this is green.
+# ---------------------------------------------------------------------------------------------
+#
+# SECRET HANDLING — see PLAN.md §4.10. The rules this file follows:
+#   * Manual trigger only. Never on push or pull_request, so each run is deliberate (it spends a
+#     share of a 500-requests/day quota) and code from a pull request can never run with the
+#     secret. Never use pull_request_target, which exposes secrets to code from forks.
+#   * The key is scoped to the single step that needs it, not the whole job.
+#   * It reaches the container as `-e QFBENCH_DEV_API_KEY` with NO value on the command line, so
+#     Docker copies it from the step's environment and it never appears in the command text.
+#   * It is never passed as a build argument — those are recorded in the image history.
+#   * It is never printed. Only "set"/"missing" and the key's length are reported.
+
+name: image-parity
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-parity
+  cancel-in-progress: false      # never kill a run midway through spending quota
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # Not secret: which provider and model the dev key is for. Kept here so they are visible and
+      # versioned. At scoring time neither is used — the harness supplies MODEL_ENDPOINT/MODEL_NAME.
+      QFBENCH_DEV_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai
+      QFBENCH_DEV_MODEL: gemini-3.5-flash-lite
+
+    steps:
+      - name: Check out quant_agent
+        uses: actions/checkout@v4
+
+      - name: Confirm the runner is native x86-64
+        run: |
+          arch="$(uname -m)"
+          echo "runner architecture: $arch"
+          if [ "$arch" != "x86_64" ]; then
+            echo "::error::expected a native x86_64 runner, got $arch"
+            exit 1
+          fi
+
+      # Fail in seconds, before a multi-minute build, if the secret is absent. Reports only whether
+      # it is set and how long it is — enough to catch a missing or truncated value, nothing more.
+      - name: Confirm the secret is present
+        env:
+          QFBENCH_DEV_API_KEY: ${{ secrets.QFBENCH_DEV_API_KEY }}
+        run: |
+          if [ -z "${QFBENCH_DEV_API_KEY}" ]; then
+            echo "::error::repository secret QFBENCH_DEV_API_KEY is not set (Settings -> Secrets and variables -> Actions)"
+            exit 1
+          fi
+          echo "QFBENCH_DEV_API_KEY: set (${#QFBENCH_DEV_API_KEY} characters)"
+
+      - name: Build the submission image (linux/amd64, native)
+        run: scripts/build.sh
+
+      # One request. Runs inside the image on Docker's default bridge network — NOT --network=none,
+      # which is what the offline verification uses and would make any model call impossible.
+      - name: Probe — one model call from inside the image
+        env:
+          QFBENCH_DEV_API_KEY: ${{ secrets.QFBENCH_DEV_API_KEY }}
+        run: |
+          docker run --rm \
+            -e QFBENCH_DEV_API_KEY \
+            -e QFBENCH_DEV_BASE_URL \
+            -e QFBENCH_DEV_MODEL \
+            --entrypoint python \
+            quant-agent:dev -c "
+          from agent.llm import LLMError, chat, resolve_config
+
+          cfg = resolve_config()
+          # Never print the key itself. Mode and model are enough to show the right backend was chosen.
+          print(f'backend : mode={cfg.mode} model={cfg.model}')
+          print(f'key     : {\"set\" if cfg.api_key else \"MISSING\"}')
+          if cfg.mode != 'dev':
+              raise SystemExit(f'expected dev mode, got {cfg.mode!r}')
+
+          try:
+              r = chat([{'role': 'user', 'content': 'Reply with exactly: OK'}], max_tokens=16)
+          except LLMError as e:
+              raise SystemExit(f'model call failed: {e}')
+
+          print(f'reply   : {r.text.strip()!r}')
+          print(f'usage   : in={r.usage.input_tokens} out={r.usage.output_tokens}')
+          if 'OK' not in r.text:
+              raise SystemExit('model answered, but not with the expected reply')
+          print('PROBE PASSED: the secret reaches the container and the model answers.')
+          "

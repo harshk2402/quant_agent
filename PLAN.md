@@ -9,20 +9,24 @@ across ~30 hidden `private-test` quantitative-finance units.
 
 ---
 
-## 0. Timeline (agenthon.net, checked 2026-09-01)
+## 0. Timeline (agenthon.net; last updated 2026-09-16)
 
 | Phase | Dates | What it means for us |
 |---|---|---|
-| **Development** | **Aug 28 – Sep 28** | **OPEN NOW — 27 days left.** Live validation leaderboard; this is the only way to run against the real house model. |
+| **Development** | **Aug 28 – Sep 28** | **Open — 12 days left as of Sep 16.** Live validation leaderboard; this is the only way to run against the real house model. The leaderboard was still empty on Sep 16. |
 | **Final** | Sep 29 – Oct 12 | **ONE submission per track**, sealed private-test units, hidden leaderboard. No iteration. |
 | **Verification** | Oct 13 – Oct 25 | Organizers rerun top submissions for reproducibility. |
 
-Registration closes **Sep 28** and is required to submit or appear on the leaderboard.
+**Registered** — that is how access to the GitHub organization and the kits was obtained.
 
 **Consequences for sequencing:**
 - The final phase is **single-shot**. Everything we learn must be learned during development.
-- Dev-phase submission limits are **not published** (not in the kit, the rules page, or the site);
-  expect to find them on CodaBench after registering. Plan as if they are tight.
+- Dev-phase submission limits are **not published** anywhere public (not in the kit, the rules page,
+  or the site). They should be visible on the submission platform, which we have access to — read
+  them there rather than inferring. Until then, plan as if they are tight.
+- **Participant failures stay in the denominator** (stated on the site): a crash or a missing file
+  scores zero against us rather than being excluded. That is the policy the never-crash and
+  placeholder-backfill design exists for.
 - Therefore: get a *working-but-plain* agent (0.3) submitted early rather than a polished one late.
   Its purpose is to observe the house model's real behaviour before we tune prompts against Gemini.
 
@@ -36,7 +40,8 @@ Registration closes **Sep 28** and is required to submit or appear on the leader
 | Architecture decisions | ✅ made (see §3) |
 | Agent code | ✅ **Phase 0 complete** — the agent generates, executes, validates and repairs |
 | Measured | **pass@1 0.299** (26/87 public tasks, graded by the organizers' own checkers) — **measured in the local venv, not in the submission image; see §4.9** |
-| Next action | **Step 0.8** (image parity, §4.9), then Phase 1 or the diagnostics in §1.1 |
+| Image | ✅ **Submission image verified on native x86-64 in CI** (0.8a) — all 16 sandbox libraries import on the architecture the fleet runs |
+| Next action | **Step 0.8b** — run the agent inside the image in CI and check parity (§4.9), then Phase 1 or §1.1 |
 
 ### 1.1 Where the 61 losses are (full sweep, 2026-09-09)
 
@@ -316,10 +321,11 @@ Work is **stepwise**: one step assigned at a time, verified concretely in Docker
 | **0.2** | ✅ **LLM client** — `agent/llm.py` (stdlib-only, OpenAI-compatible). Scoring/dev/offline backends resolve; verified inside the sandbox image; `.env` proven unable to shadow `MODEL_ENDPOINT`. Dev path **verified live** against Gemini. See §4.1. |
 | **0.3** | ✅ **Solve loop** — `agent/prompt.py` + `agent/execute.py`. Prompt (canary-stripped, resolved input paths) → generate → stage inputs → execute in a scratch dir, never the output dir. First live solve scored **reward 1.0** on `t1-zero-coupon-bootstrapping`. |
 | **0.4** | ✅ **Output-contract validator** — `agent/validate.py`. Missing, empty and unparseable files; the grader's own `reward.json`; NaN and infinity; a header with no rows; and values that cannot be right whatever the finance says (negative price, probability above one). Canary removal is the one check that **repairs rather than reports**, since detecting a leak and doing nothing still scores zero. Rules are conservative — a false alarm sends repair chasing a problem that never existed. Column check stays a **warning** (§4.3). |
-| **0.5** | ✅ **Submission image + CLI contract** — `docker/Dockerfile`, built `linux/amd64`. Verb resolves, label present, exits 0. Conformance sweep **87/87, zero crashes**. Stage 2 of the image is still outstanding (see the exit criterion below). |
+| **0.5** | ✅ **Submission image + CLI contract** — `docker/Dockerfile`, built `linux/amd64`. Verb resolves, label present, exits 0. Conformance sweep **87/87, zero crashes**. |
 | **0.6** | ✅ **Offline eval harness** — `tools/baseline_sweep.py` + `tools/testsets.py`. Runs the agent over the public tasks, grades with their real checkers, and labels every task by outcome, because a single pass rate cannot separate a crashed script from one that ran and got the numbers wrong. A quota guard stops a sweep after three consecutive rate-limit refusals rather than recording them as agent failures. |
 | **0.7** | ✅ **Repair loop** — bounded by attempts, wall clock and token budget. Feeds back both the traceback and the contract findings; the second matters because a script that runs cleanly gives the model no reason to suspect anything is wrong. **Crashes fell from 55% of tasks to 20%, and 12 tasks passed only because a retry fixed them.** |
-| **0.8** | ⬜ **Run the real agent inside the image, and check it matches** — see §4.9. Everything measured so far ran in the local venv, not in the artifact we would submit. |
+| **0.8a** | ✅ **Stage 2 image, verified on native x86-64** — full sandbox stack including a TA-Lib source build; `scripts/verify-image.sh`; `.github/workflows/verify-image.yml` runs it on GitHub's x86-64 runner. **First CI run green: all 16 libraries import on the submission architecture.** See §4.9. |
+| **0.8b** | ⬜ **Run the agent inside the image and check it matches the local numbers** — in CI, not locally, because of the emulation limit in §4.9. Needs a model key as a repository secret (§4.10). |
 
 **Exit criterion — met.** The agent is packaged as a real `linux/amd64` submission image, runs the
 full loop across all 87 public tasks, and 0.6 reports a baseline of **pass@1 0.299**. 0.7 improved
@@ -327,11 +333,8 @@ on it measurably: the share of tasks whose script crashed fell from 55% to 20%.
 
 Two items are deferred out of Phase 0, neither blocking:
 
-- **Stage 2 of the image.** It currently carries only numpy, pandas, scipy and pyarrow. The sweep
-  proved the rest of the sandbox stack is needed — a generated script reached for `statsmodels` and
-  died — so statsmodels, scikit-learn, arch, polars, matplotlib, seaborn, plotly, openpyxl, numba
-  and a TA-Lib source build must go in before any submission. Slow under emulation; do it once,
-  early, rather than discovering it near a deadline.
+- ~~**Stage 2 of the image.**~~ **Done in 0.8a.** The image now carries the full sandbox stack plus a
+  TA-Lib source build, verified importing on native x86-64.
 - **Reading column names from the unit's checker.** Filenames already come from it; columns are
   still inferred from prose, which is precisely why a column mismatch can only warn. Reading them
   from the checker is what would justify making it an error.
@@ -453,23 +456,25 @@ usage, extrapolate to 87.
 FinanceZero?), because the dev model is stronger than the house model. A later comparison sweep
 against a local open model via Ollama costs one env var and no code change.
 
-#### 4.5 Input staging — and an unresolved ambiguity
+#### 4.5 Input staging — the `/app` vs `/input` question (resolved)
 
 Most units' `instruction.md` tells the agent to read `/app/…`, because each unit's Dockerfile does
 `COPY data/ /app/…`. But the only documented mount is `<unit-dir>:/input:ro`, and **our submission
-image is what runs — not the unit image**. So `/app/curve_data.json` may not exist at solve time.
+image is what runs — not the unit image**.
 
-This looks like QFBench v1 heritage (there, the agent ran *inside* the unit image, which has the
-data at `/app`). It could not be resolved from the public kit: `qfbench2_common` is not installed
-locally, so the harness source cannot be read. **Treat it as unknown and be correct under both
-readings.**
+**Resolved by the Track 1 starter pack** (`Agenthon2026-public/starter-packs/track1/AGENTS.md`):
+41 of 87 units phrase their instructions against `/app/data`, which is where the data sits when the
+*unit image* is built; at evaluation time the unit tree is mounted read-only at `/input`, so the data
+is at `/input/environment/data/`, and "an agent that follows the instruction text literally finds
+nothing." It is QFBench v1 heritage, where the agent ran inside the unit image.
 
-- Already handled for *us*: the parser probes declared path → Dockerfile destination →
-  `/input/environment/data/` → recursive search, so `TaskContext` resolves the input either way.
-- **Not** handled for *generated code*, which will follow `instruction.md` literally and open
-  `/app/…`. So the solve loop must **stage inputs**: before executing generated code, materialize
-  each resolved input at its declared path if it is not already there (copy or symlink).
-- Resolve for real as soon as the dev phase opens or `qfbench2_common` can be installed.
+How the agent handles it (both in place since Step 0.3):
+
+- **For the parser:** inputs are resolved by probing the declared path, the Dockerfile destination,
+  `/input/environment/data/`, then a recursive search — and stored as absolute paths.
+- **For generated code:** the prompt states the resolved path explicitly, and `stage_inputs()`
+  additionally copies each input to the path the instruction text claims, because a model reading
+  `/app/data/prices.csv` in its task description will often use that path regardless.
 
 #### 4.6 Submission image + CLI contract (Step 0.5)
 
@@ -522,36 +527,6 @@ Traps, in order of how likely they are to bite:
    on the suffix and enforces neither — use the suffixed form).
 7. `license` is **our own code's** licence, not the task data's. Do not vendor task data.
 
-#### 4.9 Step 0.8 — the image has never run the real agent
-
-**Every number in §1 was produced by the local venv, not by the image we would submit.** That is a
-gap in what has actually been verified, and it has three parts:
-
-1. **The built image predates the agent.** It was last built at Step 0.5, before `prompt.py`,
-   `execute.py`, `validate.py` and the repair loop existed. It contains a placeholder.
-2. **The image has never made a model call.** `conformance.sh` runs `--network=none` and passes no
-   key, so generation always fails there and the placeholder floor takes over — which is why
-   87/87 was achieved with zero model calls. That result says the packaging is sound; it says
-   nothing about the agent.
-3. **The environments differ.** The venv now carries the full sandbox stack (statsmodels,
-   scikit-learn, arch, polars, numba and the rest); the image carries four packages. A generated
-   script that imports `statsmodels` succeeds locally and fails in the image. **So the sweep is
-   currently measuring something we do not ship.**
-
-What 0.8 requires:
-
-- Stage 2 of the image (the deferred item above): the full sandbox stack plus a TA-Lib source
-  build, under `linux/amd64` emulation.
-- Rebuild with the current agent code.
-- A dev-mode run of the image *with* model access — normal Docker networking and the key passed
-  via `docker run -e`, never baked in.
-- **A parity check**: run the representative set through the image and compare against the same
-  set run locally. Any divergence means the local number is not a measurement of the submission,
-  and the image is what counts.
-
-Cheap to state, and easy to leave until it is expensive. Until it passes, treat pass@1 0.299 as a
-measurement of the code rather than of the artifact.
-
 #### 4.8 `t1-polars-api-migration` — the one unit a placeholder can never pass
 
 First conformance sweep with the placeholder agent: **86/87 ok, 0 crashed, 0 unchecked**. The single
@@ -575,6 +550,99 @@ Two consequences:
 2. **It is the strongest argument yet for reading `checks/*.py` at run time** (§3.5 correction).
    Prose gives one filename here; the checker gives thirteen. AGENTS.md calls the checker "the only
    machine-readable statement of the output contract" — this unit shows exactly why.
+
+#### 4.9 Step 0.8 — the image has never run the real agent
+
+**Every number in §1 was produced by the local venv, not by the image we would submit.** That is a
+gap in what has actually been verified, and it has three parts:
+
+1. **The built image predates the agent.** It was last built at Step 0.5, before `prompt.py`,
+   `execute.py`, `validate.py` and the repair loop existed. It contains a placeholder.
+2. **The image has never made a model call.** `conformance.sh` runs `--network=none` and passes no
+   key, so generation always fails there and the placeholder floor takes over — which is why
+   87/87 was achieved with zero model calls. That result says the packaging is sound; it says
+   nothing about the agent.
+3. **The environments differ.** The venv now carries the full sandbox stack (statsmodels,
+   scikit-learn, arch, polars, numba and the rest); the image carries four packages. A generated
+   script that imports `statsmodels` succeeds locally and fails in the image. **So the sweep is
+   currently measuring something we do not ship.**
+
+Step 0.8 was split in two: **0.8a** builds and verifies the artifact (no model calls), **0.8b**
+runs the agent inside it and checks parity (spends API budget).
+
+**0.8a — done.** Parts 1 and 3 above are closed. The image was rebuilt with the full sandbox stack
+and the current agent, and CI verified all sixteen libraries importing on native x86-64. Part 2
+remains, and is 0.8b.
+
+What 0.8a established, in the order it was learned:
+
+- **Local amd64 verification is impossible on Apple silicon, not merely slow.** Under Rosetta,
+  heavy native imports never finish: `import arch` (which pulls in numba's JIT compiler) ran for
+  52+ minutes; with numba and arch skipped, `import polars` ran for another 52+. Skipping modules
+  one at a time only moves the hang to the next. The same image imports all sixteen natively in
+  seconds. So `verify-image.sh` skips every import under emulation and reports PARTIAL — it never
+  claims a pass it did not earn.
+- **Native x86-64 CI is therefore the only place the real artifact gets fully tested.**
+  `.github/workflows/verify-image.yml` runs on GitHub's `ubuntu-latest` runner, fails if the
+  runner is not x86_64, and fails unless the script reports a full PASS, so PARTIAL cannot turn
+  green. It triggers on pushes that touch `docker/`, `agent/` or the image scripts. It makes no
+  model calls and uses no secrets, and it does not run pytest, the sweep or any grading.
+- **Two images, kept apart.** `quant-agent:dev` is amd64, the submission artifact.
+  `quant-agent:dev-arm64` (built with `scripts/build.sh --arm64`) is native, imports everything in
+  about four seconds, and exists only for fast local iteration. It is never pushed or submitted,
+  and a result from it is not a result about the submission. The Dockerfile's platform argument
+  defaults to amd64, so a plain build stays submittable, and the two are separate tags rather than
+  one multi-arch manifest, which the starter pack warns against.
+- **The build was cheaper than feared.** About five minutes, not 15–40: TA-Lib compiled in 97s
+  under emulation and 9s natively. numba resolved to 0.67.0 alongside numpy 2.5.3, with no
+  downgrade — the `numpy<2.3` pin belonged to numba 0.61.
+- **A Docker Desktop crash corrupted the layer store.** The image's metadata survived (architecture
+  and label still read correctly) but its filesystem layers were gone. The fix was removing the
+  image, pruning the build cache and rebuilding. Symptom to recognise: metadata checks pass while
+  anything that starts a container fails.
+- **An early `verify-image.sh` reported PASS having tested nothing.** The image's ENTRYPOINT
+  swallowed the `python -c` import script as agent arguments, and the agent's always-exit-0 design
+  made the check succeed. It now overrides the entrypoint and requires the import script's own
+  completion marker, so a check that never runs cannot pass.
+
+**0.8b — what remains.**
+
+- Run the representative set through the image **with model access**, in CI rather than locally:
+  its GARCH tasks import `arch`, which would hang under local emulation exactly as the import check
+  did, and every such hang would read as an agent failure.
+- **A parity check** against the full-sweep records for the same tasks. Pass rates are a weak
+  signal, since run-to-run variance is about two tasks on sixteen. The sharp test is categorical:
+  any failure class that appears in the image but not locally — `ModuleNotFoundError` above all.
+- This is the first workflow that needs a secret; see §4.10.
+
+Until 0.8b passes, pass@1 0.299 remains a measurement of the code rather than of the artifact —
+though with the stack now verified, the likeliest source of divergence has been removed.
+
+#### 4.10 The model key in CI (for 0.8b)
+
+0.8b is the first CI job that calls a model, so it needs a key stored as a GitHub repository
+secret. Agreed approach: a **new key from a throwaway account** with nothing else attached, so the
+worst case of a leak is a revoked free-tier key.
+
+The rules that make it safe, and should hold for any workflow that touches the secret:
+
+- **Manual trigger only (`workflow_dispatch`), never on push or pull request.** Each run spends
+  ~33 of 500 daily requests, so it should be a deliberate act — and keeping it off `pull_request`
+  means untrusted code in a pull request can never run with the secret. Never use
+  `pull_request_target`, which does expose secrets to code from forks.
+- **Least-privilege job permissions** (`contents: read`), as in `verify-image.yml`.
+- **Passed only to the step that needs it**, via `env:` on that step rather than the whole job, and
+  into the container with `docker run -e`, never as a build argument — build arguments are
+  recorded in the image's history. The key must never be baked into an image.
+- **Never printed.** GitHub masks registered secrets in logs, and `tools/check_llm.py` already
+  prints only the key's length, but generated code must not be able to echo its environment into
+  output either. The image already runs generated code with the output directory as its only
+  deliverable target.
+- **A spend or quota cap on the throwaway account**, if the provider offers one, so a runaway loop
+  cannot cost more than the free tier.
+- **If the repository is public, workflow logs are public.** The key stays masked, but generated
+  code and task output will be readable by anyone. The practice tasks' data is licensed CC BY-NC,
+  so logs should not dump input file contents.
 
 ### Phase 1 — Derivatives pricing (~25 units, highest leverage)
 
