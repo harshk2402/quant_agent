@@ -224,7 +224,9 @@ def _generate_and_run(ctx: TaskContext, out_dir, res: SolveResult) -> None:
     for attempt in range(1, max_attempts + 1):
         res.attempts = attempt
         try:
-            reply = chat(messages, max_tokens=8000)
+            # max_tokens is capped inside the client at the House route's 4,000
+            # output-token ceiling; asking for more risks refusal, not truncation.
+            reply = chat(messages)
         except LLMError as e:
             res.llm_error = str(e)
             print(f"[solve] attempt {attempt}: model call failed: {e}", file=sys.stderr)

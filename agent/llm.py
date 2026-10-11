@@ -45,9 +45,20 @@ import urllib.request
 DEFAULT_DEV_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_DEV_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
 
-# Provisional per-unit budget from SUBMISSION_CLI.md; not yet finalised by the organizers.
-BUDGET_INPUT_TOKENS = 1_000_000
-BUDGET_OUTPUT_TOKENS = 100_000
+# The per-unit allowance is counted in REQUESTS, not tokens. The Submission Format page is explicit
+# (ruling of 2026-09-21): 25 admitted requests per unit, at most 4,000 output tokens per request,
+# both applied by the House route itself — and "there is no per-unit token budget ... the per-unit
+# token figure this page carried before that ruling is withdrawn".
+#
+# An earlier version of this file metered a 1,000,000/100,000 token budget, which was the withdrawn
+# figure. It counted the wrong quantity, and it would never have bound: a solve uses single-digit
+# requests. What binds is the request count, so that is what is tracked.
+#
+# A request is charged on ADMISSION, before forwarding, so a retry or a lost response still spends
+# a slot. Only a request refused before admission is free. The reserve below therefore leaves room
+# for transport retries rather than assuming every call lands.
+BUDGET_REQUESTS = 25
+MAX_OUTPUT_TOKENS = 4_000
 
 
 class LLMError(RuntimeError):
@@ -55,7 +66,7 @@ class LLMError(RuntimeError):
 
 
 class BudgetExceeded(LLMError):
-    """The per-unit token budget would be exceeded; stop rather than overspend."""
+    """The per-unit request allowance is spent; stop rather than overspend."""
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +121,23 @@ def resolve_config() -> LLMConfig:
         if not model:
             raise LLMError("MODEL_ENDPOINT is set but MODEL_NAME is empty -- the harness "
                            "pins the house model id in MODEL_NAME; refusing to guess.")
-        return LLMConfig("scoring", endpoint.rstrip("/"), model,
-                         os.environ.get("MODEL_API_KEY") or None)
+        # MODEL_ENDPOINT is an ORIGIN (scheme://host:port) with no path. The OpenAI-compatible API
+        # is served under /v1, and the submission contract is explicit that a request to
+        # MODEL_ENDPOINT/chat/completions, without the /v1, is refused with 403. Appending it here
+        # is safe either way: a `.rstrip("/")` endpoint that already ends in /v1 is left alone.
+        base = endpoint.rstrip("/")
+        if not base.endswith("/v1"):
+            base = base + "/v1"
+        # The House route requires `Authorization: Bearer $MODEL_TOKEN` on every request and answers
+        # 401 without it. This is per-unit and supplied by the harness; it is NOT the old
+        # MODEL_API_KEY name, which does not exist in the evaluation environment.
+        token = os.environ.get("MODEL_TOKEN", "").strip() or None
+        if not token:
+            # Not fatal here: fail at the call with the route's own error rather than refusing to
+            # start, since a missing token is an environment fault we cannot fix from inside.
+            print("[llm] warning: MODEL_ENDPOINT is set but MODEL_TOKEN is empty; the House route "
+                  "will answer 401", file=sys.stderr)
+        return LLMConfig("scoring", base, model, token)
 
     # Provider-neutral names, with the older OPENAI_* names accepted as fallbacks.
     key = (os.environ.get("QFBENCH_DEV_API_KEY")
@@ -146,14 +172,13 @@ class Usage:
         self.output_tokens += other.output_tokens
         self.calls += other.calls
 
-    def remaining(self) -> tuple[int, int]:
-        return (BUDGET_INPUT_TOKENS - self.input_tokens,
-                BUDGET_OUTPUT_TOKENS - self.output_tokens)
+    def requests_remaining(self) -> int:
+        """Admitted requests left in this unit's allowance."""
+        return BUDGET_REQUESTS - self.calls
 
     def __str__(self) -> str:
-        ri, ro = self.remaining()
-        return (f"{self.calls} calls, in={self.input_tokens} out={self.output_tokens} "
-                f"(remaining in={ri} out={ro})")
+        return (f"{self.calls}/{BUDGET_REQUESTS} requests, "
+                f"in={self.input_tokens} out={self.output_tokens} tokens")
 
 
 SESSION_USAGE = Usage()   # per-unit cumulative; the repair loop reads this to stop in time
@@ -199,7 +224,7 @@ def chat(
     messages: list[dict],
     *,
     temperature: float = 0.0,
-    max_tokens: int = 8000,
+    max_tokens: int = MAX_OUTPUT_TOKENS,
     timeout: float = 180.0,
     retries: int = 4,
     config: LLMConfig | None = None,
@@ -207,19 +232,21 @@ def chat(
 ) -> LLMResponse:
     """One chat-completion call. Deterministic by default (temperature=0).
 
-    Reproducibility: the harness reruns and compares, so temperature defaults to 0 and
-    callers should not raise it without a reason.
+    `max_tokens` is capped at the House route's per-request ceiling of 4,000 output tokens, whatever
+    the caller asks for. Sampling settings are fixed in code rather than varied per call: the rules
+    require it, though they do not require zero specifically.
     """
     cfg = config or resolve_config()
 
     if cfg.mode == "fake":
         return _fake_response(messages, cfg)
 
-    if enforce_budget:
-        rem_in, rem_out = SESSION_USAGE.remaining()
-        if rem_in <= 0 or rem_out <= 0:
-            raise BudgetExceeded(f"per-unit token budget exhausted: {SESSION_USAGE}")
-        max_tokens = min(max_tokens, max(rem_out, 1))
+    if enforce_budget and SESSION_USAGE.requests_remaining() <= 0:
+        raise BudgetExceeded(f"per-unit request allowance spent: {SESSION_USAGE}")
+
+    # Hard cap, not a default: the House route applies 4,000 output tokens per request itself, and
+    # asking for more risks the request being refused rather than merely truncated.
+    max_tokens = min(max_tokens, MAX_OUTPUT_TOKENS)
 
     payload = {
         "model": cfg.model,
@@ -234,16 +261,25 @@ def chat(
 
     last: Exception | None = None
     for attempt in range(retries):
+        # Count the attempt BEFORE sending. The House route charges a request on admission, so a
+        # timeout, a dropped response or a retry all spend a slot even though no usable answer came
+        # back. Counting only successes would let a few retries quietly overrun the 25-request
+        # allowance and have later units refused.
+        SESSION_USAGE.add(Usage(0, 0, 1))
+        if enforce_budget and SESSION_USAGE.requests_remaining() < 0:
+            raise BudgetExceeded(f"per-unit request allowance spent: {SESSION_USAGE}")
         try:
             data = _post(url, payload, headers, timeout)
             break
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:400]
-            # 4xx other than rate-limit is a config/prompt bug: retrying just wastes budget.
+            # 4xx other than rate-limit is a config or auth fault, not bad luck: retrying cannot
+            # fix it and each retry spends another slot. 401 means MODEL_TOKEN is missing or wrong;
+            # 403 at scoring most likely means the URL lacks the required /v1 prefix.
             if e.code in (400, 401, 403, 404):
                 raise LLMError(f"{cfg.mode} call failed ({e.code}) at {url}: {body}") from e
             last = LLMError(f"HTTP {e.code}: {body}")
-            # 429/503 on a free tier is normal, not an error -- wait as long as told to.
+            # 429/503 is congestion rather than an error -- wait as long as told to.
             if e.code in (429, 503):
                 hdr = (e.headers.get("Retry-After") or "").strip() if e.headers else ""
                 retry_after = float(hdr) if hdr.replace(".", "", 1).isdigit() else None
@@ -262,9 +298,10 @@ def chat(
     except (KeyError, IndexError, TypeError) as e:
         raise LLMError(f"unexpected response shape: {str(data)[:400]}") from e
 
+    # Tokens only -- the request itself was already counted above.
     u = data.get("usage") or {}
     usage = Usage(int(u.get("prompt_tokens", 0)), int(u.get("completion_tokens", 0)), 1)
-    SESSION_USAGE.add(usage)
+    SESSION_USAGE.add(Usage(usage.input_tokens, usage.output_tokens, 0))
     return LLMResponse(text, usage, cfg.model, cfg.mode)
 
 
