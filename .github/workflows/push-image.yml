@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: MIT
+#
+# Build, verify and publish the submission image to GHCR.
+#
+# The zip uploaded to the competition does not contain the image — it contains a descriptor that
+# names the image BY DIGEST, and the evaluation worker pulls it itself, anonymously. So the image
+# has to be public first, and the digest has to exist before a descriptor can reference it.
+#
+# Why this runs in CI rather than from a laptop:
+#   * the runner is native x86-64, so there is no emulated build;
+#   * GHCR authentication uses the runner's own GITHUB_TOKEN, so no registry credential is handled
+#     by hand anywhere;
+#   * build, verify and push happen in one run, so the bytes that are published are provably the
+#     bytes that passed verification — there is no gap in which a separate local build could differ.
+#
+# It will not push an image that fails verification. That check includes all sixteen sandbox
+# libraries importing, which on this runner is a real test (locally, under emulation, those imports
+# never finish).
+#
+# AFTER THE FIRST PUSH, ONE MANUAL STEP: a new GHCR package is PRIVATE by default and making it
+# public is a UI-only action with no API —
+#     github.com/users/<owner>/packages -> the package -> Package settings -> Change visibility
+# Until that is done the anonymous pull check at the end of this workflow fails, which is the point:
+# a private image fails at container creation and yields NO SCORE rather than a zero, and it fails
+# inconsistently, since a worker that already holds the layers runs it fine.
+
+name: push-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (the digest is what the descriptor uses)"
+        required: false
+        default: "submission"
+
+permissions:
+  contents: read
+  packages: write        # the only elevated permission here, and only for GHCR
+
+concurrency:
+  group: push-image
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      REGISTRY: ghcr.io
+      # github.repository_owner keeps this correct if the repo is ever moved or renamed.
+      IMAGE_PATH: ${{ github.repository_owner }}/quant-agent
+
+    steps:
+      # Both repos are checked out side by side under the workspace, because the scripts locate the
+      # practice kit as a SIBLING of this repo. actions/checkout refuses a path outside the
+      # workspace, so the kit cannot simply be placed at "../".
+      - name: Check out quant_agent
+        uses: actions/checkout@v4
+        with:
+          path: quant_agent
+
+      - name: Check out the practice task used by the verb check
+        uses: actions/checkout@v4
+        with:
+          repository: Agenthon-2026/track1-coding-public
+          path: track1-coding-public
+          sparse-checkout: units/t1-zero-coupon-bootstrapping
+
+      - name: Confirm the runner is native x86-64
+        run: |
+          arch="$(uname -m)"
+          echo "runner architecture: $arch"
+          if [ "$arch" != "x86_64" ]; then
+            echo "::error::expected a native x86_64 runner, got $arch"
+            exit 1
+          fi
+
+      - name: Build the submission image
+        working-directory: quant_agent
+        run: scripts/build.sh
+
+      # Nothing is published unless this passes in full. PARTIAL — which is what the script reports
+      # when it believes it is emulated — must not be treated as a pass.
+      - name: Verify before publishing
+        working-directory: quant_agent
+        run: |
+          set -o pipefail
+          scripts/verify-image.sh quant-agent:dev | tee verify.log
+          if ! grep -qE '^PASS .* image is submittable' verify.log; then
+            echo "::error::verification did not report a full pass — refusing to publish"
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+
+      - name: Push
+        id: push
+        run: |
+          TARGET="$REGISTRY/$IMAGE_PATH:${{ inputs.tag }}"
+          docker tag quant-agent:dev "$TARGET"
+          docker push "$TARGET"
+
+          # The digest the descriptor must name. It identifies the manifest in the REGISTRY, not
+          # the local image id, and exists only after the push.
+          DIGEST=$(docker image inspect "$TARGET" --format '{{join .RepoDigests "\n"}}' \
+                   | grep -F "$IMAGE_PATH@" | head -1 | cut -d@ -f2)
+          if [ -z "$DIGEST" ]; then
+            echo "::error::pushed, but no registry digest was recorded"
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "pushed $TARGET"
+          echo "digest $DIGEST"
+
+      # The only check that means anything. `docker pull` and `manifest inspect` use the runner's
+      # credential and would succeed on a private package, proving nothing — so this requests a
+      # token with no credentials at all.
+      - name: Anonymous pull check
+        id: anon
+        continue-on-error: true      # a private package is expected on the first ever push
+        run: |
+          DIGEST='${{ steps.push.outputs.digest }}'
+          TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:${IMAGE_PATH}:pull&service=ghcr.io" \
+                  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+                 -H "Authorization: Bearer $TOKEN" \
+                 -H 'Accept: application/vnd.oci.image.index.v1+json' \
+                 -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+                 "https://ghcr.io/v2/${IMAGE_PATH}/manifests/${DIGEST}")
+          echo "anonymous manifest fetch: HTTP $CODE"
+          [ "$CODE" = "200" ]
+
+      - name: Summary
+        if: always()
+        run: |
+          DIGEST='${{ steps.push.outputs.digest }}'
+          {
+            echo "## Submission image"
+            echo
+            echo '```'
+            echo "image  : $REGISTRY/$IMAGE_PATH"
+            echo "digest : $DIGEST"
+            echo '```'
+            echo
+            if [ '${{ steps.anon.outcome }}' = 'success' ]; then
+              echo "Anonymously pullable. Build the descriptor with:"
+              echo
+              echo '```'
+              echo "python3 tools/make_submission.py --image $REGISTRY/$IMAGE_PATH --digest $DIGEST ..."
+              echo '```'
+            else
+              echo "**NOT anonymously pullable yet.** A new GHCR package is private by default."
+              echo "Make it public, then re-run this workflow (or just the check):"
+              echo
+              echo "github.com/users/${{ github.repository_owner }}/packages -> quant-agent ->"
+              echo "Package settings -> Change visibility -> Public"
+              echo
+              echo "An image the worker cannot pull yields no score at all, not a zero."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
