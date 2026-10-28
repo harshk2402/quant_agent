@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
-"""Named subsets of the practice tasks, for iterating without paying for all 87 every time.
+"""Named subsets of the practice tasks, and the one task held out of the denominator.
 
-A full sweep is ~15 minutes and 87 model calls. That is the right thing to run before a
+A full sweep is ~45 minutes and 86 model calls. That is the right thing to run before a
 submission and the wrong thing to run while changing a prompt, so these fixed subsets exist to
 give a signal in two or three minutes.
 
@@ -17,6 +17,12 @@ Two rules make the numbers comparable over time:
 Outcomes referenced below come from the first baseline sweep (33 of 87 tasks, pass@1 0.182). They
 are a starting point for selection, not a permanent label — a task that crashes today may run
 cleanly once the repair loop exists, which is the point.
+
+EXCLUDED is not a convenience. A task nobody can pass is a constant subtracted from every score,
+and leaving it in the denominator makes each run look worse by the same fixed amount while hiding
+real movement in the noise. Taking it out has to be visible rather than quiet, though, which is why
+the reason is written here and the sweep prints what it skipped — a shrinking denominator is
+exactly how a benchmark gets talked into flattering itself.
 """
 from __future__ import annotations
 
@@ -45,9 +51,6 @@ REPRESENTATIVE = [
     "t1-credit-migration-matrix",        # credit
     "t1-dcc-garch-portfolio-var",        # risk, multivariate GARCH
 
-    # --- structural oddity: the only task whose deliverable is code, and whose checker asserts on
-    #     files that exist only once that code has been RUN (see PLAN.md 4.8)
-    "t1-polars-api-migration",
 ]
 
 #: Five tasks, under a minute. For "did I break the pipeline", not for measuring quality.
@@ -56,8 +59,23 @@ SMOKE = [
     "t1-cir-bond-pricing",
     "t1-barone-adesi-whaley",
     "t1-asian-option-levy-curran",
-    "t1-polars-api-migration",
 ]
+
+#: Tasks held out of the roster, with the reason. Keyed by unit id so the sweep can both skip them
+#: and say that it did.
+EXCLUDED: dict[str, str] = {
+    # The deliverable is a Python module, not data, and the unit's checker imports that module and
+    # asserts on files which only exist once it has been RUN. Nothing the agent can write to the
+    # output directory satisfies it, because the grader never executes what we hand in. Verified by
+    # reading the checker rather than inferred from the task failing (see PLAN.md 4.8).
+    "t1-polars-api-migration": "checker asserts on artefacts of running the deliverable, which the "
+                               "grader never runs — unreachable, not merely hard",
+}
+
+
+def is_excluded(unit_id: str) -> bool:
+    return unit_id in EXCLUDED
+
 
 SETS = {
     "representative": REPRESENTATIVE,

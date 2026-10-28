@@ -34,6 +34,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
+import sys
 import pathlib
 import ssl
 import time
@@ -102,10 +104,98 @@ class LLMConfig:
     base_url: str
     model: str
     api_key: str | None
+    #: Further DEV keys, tried in order when one is refused for quota. Development only: the
+    #: scoring route has exactly one token, issued by the harness, and nothing to rotate to.
+    spare_keys: tuple[str, ...] = ()
 
     @property
     def is_scoring(self) -> bool:
         return self.mode == "scoring"
+
+
+#: Signs that a refusal is about an allowance rather than about the request. Deliberately broad:
+#: the cost of reading a genuine fault as a quota problem is one wasted retry on another key, while
+#: the cost of the reverse is a sweep stopping with hours of allowance unused.
+_QUOTA_SIGNS = ("429", "rate limit", "ratelimit", "quota", "resource_exhausted", "exhausted",
+                "too many requests")
+
+
+#: Routes that have refused the `reasoning` field, so it is sent once per route and then dropped.
+#: Without this every call would pay a rejected request plus a retry, and at 25 requests per unit
+#: that is most of the allowance spent on a field we already know is unwelcome.
+_REASONING_REFUSED: set[str] = set()
+
+
+def reasoning_control() -> dict | None:
+    """The `reasoning` field to send, or None to leave the provider's default alone.
+
+    `QFBENCH_REASONING=on` leaves it alone; anything else (including unset) disables it.
+    Off by default because of what it costs us: this model spends most of every response
+    deliberating, charged against the SAME 4,000-token ceiling as the answer, so on a hard unit it
+    reasons for the whole budget and returns no code at all. Measured across eight controls on this
+    provider -- system prompts, `/nothink`, `chat_template_kwargs`, `reasoning_effort` -- this is
+    the only one that works: reasoning tokens go to zero and the answer still arrives.
+
+    The deliberation still has to happen somewhere. It happens in the planning call, where the
+    output is kept and fed forward, instead of being thrown away once per request.
+    """
+    if os.environ.get("QFBENCH_REASONING", "").strip().lower() == "on":
+        return None
+    return {"enabled": False}
+
+
+def looks_like_quota(text: str) -> bool:
+    return any(sign in (text or "").lower() for sign in _QUOTA_SIGNS)
+
+
+def dev_provider() -> str:
+    """The named development provider in use, or "" for the unprefixed `QFBENCH_DEV_*` variables.
+
+    Set `QFBENCH_DEV_PROVIDER=nemotron` and the client reads `QFBENCH_NEMOTRON_API_KEY`,
+    `QFBENCH_NEMOTRON_BASE_URL` and `QFBENCH_NEMOTRON_MODEL`. The point is that several providers'
+    keys can sit in `.env` at once and switching between them is one line rather than re-pasting
+    three -- which matters here because the two are not interchangeable: one is the model that
+    actually grades us, and the other is a faster, stronger stand-in useful only for exercising
+    the machinery.
+    """
+    load_dotenv()
+    return re.sub(r"[^A-Z0-9_]", "", os.environ.get("QFBENCH_DEV_PROVIDER", "").strip().upper())
+
+
+def _provider_var(name: str, provider: str | None = None) -> str:
+    """Read `QFBENCH_<PROVIDER>_<NAME>`, falling back to `QFBENCH_DEV_<NAME>`."""
+    provider = dev_provider() if provider is None else provider
+    if provider:
+        value = (os.environ.get(f"QFBENCH_{provider}_{name}") or "").strip()
+        if value:
+            return value
+    return (os.environ.get(f"QFBENCH_DEV_{name}") or "").strip()
+
+
+def dev_api_keys() -> list[str]:
+    """Every development key configured, in the order they should be tried.
+
+    The selected provider's key first, then its numbered spares, then the unprefixed
+    `QFBENCH_DEV_API_KEY` family, then the older `OPENAI_API_KEY`. Several keys exist because a
+    free tier has a daily allowance and a sweep is hundreds of requests: exhausting one should move
+    to the next rather than abandon the run. Order is preserved and duplicates are dropped, so the
+    same key listed twice cannot waste an attempt.
+    """
+    load_dotenv()                 # callers outside resolve_config() must see .env too
+    provider = dev_provider()
+    names: list[str] = []
+    if provider:
+        names.append(f"QFBENCH_{provider}_API_KEY")
+        names += [f"QFBENCH_{provider}_API_KEY{n}" for n in range(2, 10)]
+    names.append("QFBENCH_DEV_API_KEY")
+    names += [f"QFBENCH_DEV_API_KEY{n}" for n in range(2, 10)]
+    names.append("OPENAI_API_KEY")
+    seen: list[str] = []
+    for name in names:
+        key = (os.environ.get(name) or "").strip()
+        if key and key not in seen:
+            seen.append(key)
+    return seen
 
 
 def resolve_config() -> LLMConfig:
@@ -139,9 +229,8 @@ def resolve_config() -> LLMConfig:
                   "will answer 401", file=sys.stderr)
         return LLMConfig("scoring", base, model, token)
 
-    # Provider-neutral names, with the older OPENAI_* names accepted as fallbacks.
-    key = (os.environ.get("QFBENCH_DEV_API_KEY")
-           or os.environ.get("OPENAI_API_KEY", "")).strip()
+    keys = dev_api_keys()
+    key = keys[0] if keys else ""
     if not key:
         raise LLMError(
             "No model backend configured.\n"
@@ -150,11 +239,11 @@ def resolve_config() -> LLMConfig:
             "            ready-made Gemini / Anthropic / OpenAI / Ollama blocks)\n"
             "  offline : export QFBENCH_FAKE_LLM=1 to run the loop without a model"
         )
-    base = (os.environ.get("QFBENCH_DEV_BASE_URL")
+    base = (_provider_var("BASE_URL")
             or os.environ.get("OPENAI_BASE_URL")
             or DEFAULT_DEV_BASE_URL)
-    return LLMConfig("dev", base.rstrip("/"),
-                     os.environ.get("QFBENCH_DEV_MODEL", DEFAULT_DEV_MODEL), key)
+    model = _provider_var("MODEL") or DEFAULT_DEV_MODEL
+    return LLMConfig("dev", base.rstrip("/"), model, key, spare_keys=tuple(keys[1:]))
 
 
 # ---------------------------------------------------------------------------
@@ -166,19 +255,27 @@ class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
     calls: int = 0
+    #: Of `output_tokens`, how many went on the model's internal reasoning rather than its answer.
+    #: A thinking model is charged for both against the SAME per-request ceiling, so this is the
+    #: share of the 4,000-token budget that never reaches the script. Measured once by hand it was
+    #: 77 of 88 tokens; recorded here so the share is visible across a whole run instead.
+    reasoning_tokens: int = 0
 
     def add(self, other: "Usage") -> None:
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
         self.calls += other.calls
+        self.reasoning_tokens += other.reasoning_tokens
 
     def requests_remaining(self) -> int:
         """Admitted requests left in this unit's allowance."""
         return BUDGET_REQUESTS - self.calls
 
     def __str__(self) -> str:
+        thinking = (f" ({self.reasoning_tokens} of them reasoning)"
+                    if self.reasoning_tokens else "")
         return (f"{self.calls}/{BUDGET_REQUESTS} requests, "
-                f"in={self.input_tokens} out={self.output_tokens} tokens")
+                f"in={self.input_tokens} out={self.output_tokens} tokens{thinking}")
 
 
 SESSION_USAGE = Usage()   # per-unit cumulative; the repair loop reads this to stop in time
@@ -190,6 +287,20 @@ class LLMResponse:
     usage: Usage
     model: str
     mode: str
+    #: Why the model stopped. "stop" is a complete answer; "length" means it ran into the output
+    #: ceiling and the text is cut off mid-stream. Routes that omit the field give "" -- absence is
+    #: not evidence of completion, which is why the assembler also checks that the code parses.
+    finish_reason: str = ""
+    #: The model's internal deliberation, when the route returns it separately from the answer.
+    #: Worth keeping rather than discarding: on a hard task this model spends its ENTIRE 4,000-token
+    #: response working out an approach and emits no content at all, so this is often the only thing
+    #: we got for a whole request. Feeding it into the next call turns a wasted response into an
+    #: input, which is the cheapest plan we will ever get.
+    reasoning: str = ""
+
+    @property
+    def truncated(self) -> bool:
+        return self.finish_reason == "length"
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +336,7 @@ def chat(
     *,
     temperature: float = 0.0,
     max_tokens: int = MAX_OUTPUT_TOKENS,
+    seed: int | None = None,
     timeout: float = 180.0,
     retries: int = 4,
     config: LLMConfig | None = None,
@@ -254,10 +366,33 @@ def chat(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    # temperature=0 is NOT determinism: these routes batch requests and accumulate floating point
+    # differently depending on what else is in the batch, so ties break differently. Measured here
+    # -- the same prompt twice produced 312- and 271-line scripts that diverged at line 9. A seed
+    # is the only lever on that, and it matters twice over: without it no before/after comparison
+    # means anything, and the competition re-runs submissions to check they reproduce.
+    #
+    # Sent only when asked for, and withdrawn on a 400 (below), because an unknown field is a hard
+    # refusal on some routes and a refused call at scoring time costs the whole task.
+    if seed is None:
+        raw = os.environ.get("QFBENCH_MODEL_SEED", "").strip()
+        seed = int(raw) if raw.lstrip("-").isdigit() else None
+    if seed is not None:
+        payload["seed"] = seed
+
+    control = reasoning_control()
+    if control is not None and cfg.base_url not in _REASONING_REFUSED:
+        payload["reasoning"] = control
     headers = {"Content-Type": "application/json"}
     if cfg.api_key:
         headers["Authorization"] = f"Bearer {cfg.api_key}"
     url = f"{cfg.base_url}/chat/completions"
+
+    # Development only. A free tier's allowance is daily and a full sweep is 86 units, so a second
+    # key is the difference between finishing a run and resuming it tomorrow. The scoring route has
+    # one token issued by the harness and `spare_keys` is empty there, so this never fires.
+    key_ring = [k for k in (cfg.api_key, *cfg.spare_keys) if k]
+    key_index = 0
 
     last: Exception | None = None
     for attempt in range(retries):
@@ -276,9 +411,31 @@ def chat(
             # 4xx other than rate-limit is a config or auth fault, not bad luck: retrying cannot
             # fix it and each retry spends another slot. 401 means MODEL_TOKEN is missing or wrong;
             # 403 at scoring most likely means the URL lacks the required /v1 prefix.
+            if e.code in (400, 404, 422) and ("reasoning" in payload or "seed" in payload):
+                # The route may not take an optional field. Drop both and retry once, whatever the
+                # body says: a generic "unknown field" message would otherwise fail every call at
+                # scoring time, and answering matters more than controlling the thinking or the
+                # seed. Remembered per route so later calls do not pay the refused request again.
+                payload.pop("reasoning", None)
+                payload.pop("seed", None)
+                _REASONING_REFUSED.add(cfg.base_url)
+                print("[llm] this route rejected the request; retrying without the optional "
+                      "`reasoning`/`seed` fields", file=sys.stderr)
+                continue
             if e.code in (400, 401, 403, 404):
                 raise LLMError(f"{cfg.mode} call failed ({e.code}) at {url}: {body}") from e
             last = LLMError(f"HTTP {e.code}: {body}")
+            # A refused request on one key may be accepted on another: a per-minute limit is scoped
+            # to the project the key belongs to, and a daily allowance certainly is. Rotating is
+            # tried BEFORE waiting, because when it works the wait was unnecessary -- and when no
+            # key is left the backoff below still happens.
+            if (e.code == 429 and looks_like_quota(f"{e.code} {body}")
+                    and key_index + 1 < len(key_ring)):
+                key_index += 1
+                headers["Authorization"] = f"Bearer {key_ring[key_index]}"
+                print(f"[llm] key {key_index} was refused for quota; trying key "
+                      f"{key_index + 1} of {len(key_ring)}", file=sys.stderr)
+                continue
             # 429/503 is congestion rather than an error -- wait as long as told to.
             if e.code in (429, 503):
                 hdr = (e.headers.get("Retry-After") or "").strip() if e.headers else ""
@@ -294,15 +451,23 @@ def chat(
         raise LLMError(f"model call failed after {retries} attempts: {last}")
 
     try:
-        text = data["choices"][0]["message"]["content"] or ""
+        choice = data["choices"][0]
+        text = choice["message"]["content"] or ""
     except (KeyError, IndexError, TypeError) as e:
         raise LLMError(f"unexpected response shape: {str(data)[:400]}") from e
+    # Recorded rather than inferred. Until now a response cut off at the ceiling was
+    # indistinguishable from a complete one, which is how half the roster came to be generating
+    # scripts that ran into the 4,000-token cap without anything noticing.
+    finish_reason = str(choice.get("finish_reason") or "")
+    reasoning = str(choice.get("message", {}).get("reasoning") or "")
 
     # Tokens only -- the request itself was already counted above.
     u = data.get("usage") or {}
-    usage = Usage(int(u.get("prompt_tokens", 0)), int(u.get("completion_tokens", 0)), 1)
-    SESSION_USAGE.add(Usage(usage.input_tokens, usage.output_tokens, 0))
-    return LLMResponse(text, usage, cfg.model, cfg.mode)
+    details = u.get("completion_tokens_details") or {}
+    usage = Usage(int(u.get("prompt_tokens", 0)), int(u.get("completion_tokens", 0)), 1,
+                  int(details.get("reasoning_tokens", 0) or 0))
+    SESSION_USAGE.add(Usage(usage.input_tokens, usage.output_tokens, 0, usage.reasoning_tokens))
+    return LLMResponse(text, usage, cfg.model, cfg.mode, finish_reason, reasoning)
 
 
 def _fake_response(messages: list[dict], cfg: LLMConfig) -> LLMResponse:
@@ -316,7 +481,10 @@ def _fake_response(messages: list[dict], cfg: LLMConfig) -> LLMResponse:
     )
     usage = Usage(sum(len(m.get("content", "")) // 4 for m in messages), len(canned) // 4, 1)
     SESSION_USAGE.add(usage)
-    return LLMResponse(canned, usage, cfg.model, "fake")
+    # QFBENCH_FAKE_FINISH lets a test drive the truncation path without a network call. The
+    # assembler's whole job is reacting to "length", so it has to be reachable offline.
+    return LLMResponse(canned, usage, cfg.model, "fake",
+                       os.environ.get("QFBENCH_FAKE_FINISH", "stop"))
 
 
 def complete(prompt: str, *, system: str | None = None, **kw) -> str:

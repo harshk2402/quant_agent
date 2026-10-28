@@ -219,3 +219,7 @@ __marimo__/
 
 # Evaluation sweep output (large, regenerated, machine-specific)
 sweeps/
+
+# Built submission archives — regenerated artifacts, and the build reads the Team Key
+submission.zip
+submission.json

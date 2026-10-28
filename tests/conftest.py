@@ -19,4 +19,10 @@ import pytest
 @pytest.fixture(autouse=True, scope="session")
 def _no_model_calls_in_tests():
     os.environ["QFBENCH_NO_LLM"] = "1"
+    # Plan-first is off by default in tests so that a scripted sequence of replies lines up with
+    # the calls the test is about. Tests that exercise planning turn it back on explicitly, which
+    # also keeps it visible in the test that it is a behaviour being chosen rather than inherited.
+    os.environ["QFBENCH_NO_PLAN_FIRST"] = "1"
+    # The critic is off by default in production too; nothing in the suite depends on it running.
+    os.environ.pop("QFBENCH_CRITIC", None)
     yield

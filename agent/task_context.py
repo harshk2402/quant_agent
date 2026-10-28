@@ -36,7 +36,6 @@ import json
 import os
 import pathlib
 import re
-from typing import Iterable
 
 try:  # Python 3.11+; the sandbox runs 3.13
     import tomllib

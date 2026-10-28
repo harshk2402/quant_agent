@@ -5,7 +5,7 @@ The numerics are hand-written (no LLM yet -- that's Step 0.2), but EVERY path an
 filename comes from TaskContext, nothing is hardcoded. Swap the task dir and the
 same script writes to whatever that unit declares.
 """
-import json, math, pathlib, sys
+import json, math, sys
 sys.path.insert(0, "/")
 from agent.task_context import parse_task, resolve_output_dir
 

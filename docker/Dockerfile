@@ -67,6 +67,13 @@ ENV PATH="/opt/venv/bin:$PATH"
 # yfinance is included for parity with the sandbox even though the network is disabled at run time;
 # a script that imports it then fails on the fetch rather than on the import.
 #
+# pyflakes is the one package here that the GENERATED code never imports: the agent itself
+# uses it, to check an assembled script for names used but never assigned before spending an
+# execution on it. Not a style check. A script is generated across several responses because
+# one response is capped at 4,000 output tokens, and a join that drops a line leaves exactly
+# this kind of break -- measured across seven units, an undefined name was the largest single
+# failure once assembly was working. Pure Python, about a megabyte.
+#
 # numba is NOT in requirements-sandbox.txt, but the exemplar unit adds it in its own Dockerfile —
 # a task author expected it to be importable, and at evaluation time OUR image runs, not the unit's,
 # so a per-unit dependency exists only if we ship it. It was expected to force a numpy downgrade
@@ -90,7 +97,8 @@ RUN pip install --no-cache-dir \
         "openpyxl>=3.1" \
         "tqdm>=4.66" \
         "requests>=2.31" \
-        "numba>=0.61.2"
+        "numba>=0.61.2" \
+        "pyflakes>=3.2"
 
 # Bytecode and test trees are dead weight in a pulled image. Removing them is safe: Python
 # regenerates bytecode on demand, and PYTHONDONTWRITEBYTECODE below stops it writing any back.
