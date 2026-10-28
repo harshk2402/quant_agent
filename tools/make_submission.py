@@ -155,9 +155,10 @@ def main() -> int:
     ap.add_argument("--digest", default="", help="sha256:<64 hex> of the PUSHED image")
     ap.add_argument("--from-pushed-image", default="",
                     help="read the digest from a local tag that has been pushed")
-    ap.add_argument("--phase", default="dev", choices=["dev", "final", "verification"],
+    ap.add_argument("--phase", default="dev", choices=["dev", "final"],
                     help="must match the phase you upload into; a mismatch is refused "
-                         "before the image is pulled")
+                         "before the image is pulled. Final & Verification is ONE phase: "
+                         "competition_id agenthon2026-coding-final, phase final")
     ap.add_argument("--out", default="submission.zip")
     args = ap.parse_args()
 
